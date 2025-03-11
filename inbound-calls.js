@@ -1,41 +1,19 @@
+// Code for unauthenticated inbound calls with your agent
+
 import WebSocket from "ws";
 
 export function registerInboundRoutes(fastify) {
-  // Check for the required environment variables
-  const { ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID } = process.env;
+  // Check for the required ElevenLabs Agent ID
+  const { ELEVENLABS_AGENT_ID } = process.env;
 
-  if (!ELEVENLABS_API_KEY || !ELEVENLABS_AGENT_ID) {
-    console.error("Missing required environment variables");
-    throw new Error("Missing ELEVENLABS_API_KEY or ELEVENLABS_AGENT_ID");
-  }
-
-  // Helper function to get signed URL for authenticated conversations
-  async function getSignedUrl() {
-    try {
-      const response = await fetch(
-        `https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=${ELEVENLABS_AGENT_ID}`,
-        {
-          method: 'GET',
-          headers: {
-            'xi-api-key': ELEVENLABS_API_KEY
-          }
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error(`Failed to get signed URL: ${response.statusText}`);
-      }
-
-      const data = await response.json();
-      return data.signed_url;
-    } catch (error) {
-      console.error("Error getting signed URL:", error);
-      throw error;
-    }
+  if (!ELEVENLABS_AGENT_ID) {
+    console.error("Missing ELEVENLABS_AGENT_ID in environment variables");
+    throw new Error("Missing ELEVENLABS_AGENT_ID in environment variables");
   }
 
   // Route to handle incoming calls from Twilio
   fastify.all("/incoming-call-eleven", async (request, reply) => {
+    // Generate TwiML response to connect the call to a WebSocket stream
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
         <Connect>
@@ -48,18 +26,18 @@ export function registerInboundRoutes(fastify) {
 
   // WebSocket route for handling media streams from Twilio
   fastify.register(async (fastifyInstance) => {
-    fastifyInstance.get("/media-stream", { websocket: true }, async (connection, req) => {
-      console.info("[Server] Twilio connected to media stream.");
+    fastifyInstance.get(
+      "/media-stream",
+      { websocket: true },
+      (connection, req) => {
+        console.info("[Server] Twilio connected to media stream.");
 
-      let streamSid = null;
-      let elevenLabsWs = null;
+        let streamSid = null;
 
-      try {
-        // Get authenticated WebSocket URL
-        const signedUrl = await getSignedUrl();
-
-        // Connect to ElevenLabs using the signed URL
-        elevenLabsWs = new WebSocket(signedUrl);
+        // Connect to ElevenLabs Conversational AI WebSocket
+        const elevenLabsWs = new WebSocket(
+          `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${ELEVENLABS_AGENT_ID}`,
+        );
 
         // Handle open event for ElevenLabs WebSocket
         elevenLabsWs.on("open", () => {
@@ -94,6 +72,7 @@ export function registerInboundRoutes(fastify) {
               break;
             case "audio":
               if (message.audio_event?.audio_base_64) {
+                // Send audio data to Twilio
                 const audioData = {
                   event: "media",
                   streamSid,
@@ -105,9 +84,11 @@ export function registerInboundRoutes(fastify) {
               }
               break;
             case "interruption":
+              // Clear Twilio's audio queue
               connection.send(JSON.stringify({ event: "clear", streamSid }));
               break;
             case "ping":
+              // Respond to ping events from ElevenLabs
               if (message.ping_event?.event_id) {
                 const pongResponse = {
                   type: "pong",
@@ -125,24 +106,26 @@ export function registerInboundRoutes(fastify) {
             const data = JSON.parse(message);
             switch (data.event) {
               case "start":
+                // Store Stream SID when stream starts
                 streamSid = data.start.streamSid;
                 console.log(`[Twilio] Stream started with ID: ${streamSid}`);
                 break;
               case "media":
-                if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+                // Route audio from Twilio to ElevenLabs
+                if (elevenLabsWs.readyState === WebSocket.OPEN) {
+                  // data.media.payload is base64 encoded
                   const audioMessage = {
                     user_audio_chunk: Buffer.from(
                       data.media.payload,
-                      "base64"
+                      "base64",
                     ).toString("base64"),
                   };
                   elevenLabsWs.send(JSON.stringify(audioMessage));
                 }
                 break;
               case "stop":
-                if (elevenLabsWs) {
-                  elevenLabsWs.close();
-                }
+                // Close ElevenLabs WebSocket when Twilio stream stops
+                elevenLabsWs.close();
                 break;
               default:
                 console.log(`[Twilio] Received unhandled event: ${data.event}`);
@@ -154,27 +137,16 @@ export function registerInboundRoutes(fastify) {
 
         // Handle close event from Twilio
         connection.on("close", () => {
-          if (elevenLabsWs) {
-            elevenLabsWs.close();
-          }
+          elevenLabsWs.close();
           console.log("[Twilio] Client disconnected");
         });
 
         // Handle errors from Twilio WebSocket
         connection.on("error", (error) => {
           console.error("[Twilio] WebSocket error:", error);
-          if (elevenLabsWs) {
-            elevenLabsWs.close();
-          }
-        });
-
-      } catch (error) {
-        console.error("[Server] Error initializing conversation:", error);
-        if (elevenLabsWs) {
           elevenLabsWs.close();
-        }
-        connection.socket.close();
-      }
-    });
+        });
+      },
+    );
   });
 }
